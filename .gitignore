@@ -4,6 +4,11 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+*.db
+*.db-shm
+*.db-wal
+
+
 
 # Node
 frontend/node_modules/

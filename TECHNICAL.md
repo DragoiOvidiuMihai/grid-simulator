@@ -1,4 +1,4 @@
-# Technical Documentation — Grid Simulator
+# Technical Documentation — Grid Simulator & SCADA/HMI
 
 ## Table of Contents
 
@@ -11,9 +11,16 @@
 7. [Fault Study Implementation](#7-fault-study-implementation)
 8. [EN 50160 Compliance Engine](#8-en-50160-compliance-engine)
 9. [PDF Report Generator](#9-pdf-report-generator)
-10. [Frontend Architecture](#10-frontend-architecture)
-11. [Key Engineering Decisions](#11-key-engineering-decisions)
+10. [Frontend Architecture — Grid Simulator](#10-frontend-architecture--grid-simulator)
+11. [Key Engineering Decisions — Grid Simulator](#11-key-engineering-decisions--grid-simulator)
 12. [Validation and Correctness](#12-validation-and-correctness)
+13. [SCADA/HMI Module Architecture](#13-scadahmi-module-architecture)
+14. [SCADA Data Sources](#14-scada-data-sources)
+15. [SCADA Alarm Engine](#15-scada-alarm-engine)
+16. [SCADA WebSocket Protocol](#16-scada-websocket-protocol)
+17. [SCADA History Store](#17-scada-history-store)
+18. [SCADA Frontend Architecture](#18-scada-frontend-architecture)
+19. [Key Engineering Decisions — SCADA](#19-key-engineering-decisions--scada)
 
 ---
 
@@ -29,6 +36,9 @@ The component library contains 8 components. Every parameter — conductor imped
 
 **Separate concerns cleanly.**
 The system is divided into four layers that never overlap: data validation (Pydantic models), network description (DSS script translator), simulation (OpenDSS solver wrapper), and presentation (React frontend). Each layer has a single responsibility and communicates with adjacent layers through well-defined interfaces.
+
+**The SCADA module extends without modifying.**
+The SCADA/HMI module was designed as a plugin: it adds a new FastAPI router, a new React route, and a new backend package (`backend/scada/`) without touching any existing file from the original Grid Simulator. The existing REST endpoints, frontend canvas, data models, and solvers are completely unaffected.
 
 ---
 
@@ -64,16 +74,50 @@ React Frontend
   Results panel displays voltages, currents, losses
 ```
 
+### SCADA/HMI data flow
+
+```
+asyncio background task (SimulationLoop)
+  every 5 seconds:
+        │
+        ▼
+DataSource.get_measurements(breaker_states)
+  SyntheticDataSource   → mathematical profile
+  OpenDSSDataSource     → real power flow via opendssdirect
+        │
+        ▼
+AlarmEngine.evaluate(measurements)
+  check each measurement against thresholds
+  update alarm lifecycle (ACTIVE / ACKNOWLEDGED / CLEARED)
+        │
+        ▼
+EventLog  → record newly raised / cleared alarms
+HistoryStore → write to SQLite
+        │
+        ▼
+ConnectionManager.broadcast(packet)
+  push JSON to all connected WebSocket clients
+        │
+        ▼ WebSocket push
+React SCADA frontend
+  scadaStore ← applyStateUpdate(packet)
+  SingleLineDiagram re-renders with new colours/values
+  AlarmPanel re-renders with new alarm list
+```
+
 ### Technology choices
 
 | Layer | Technology | Reason |
 |-------|-----------|--------|
 | Simulation engine | OpenDSS via opendssdirect.py | Professional-grade validated solver |
-| Backend framework | FastAPI | Async-capable, auto-generates API docs, native Pydantic integration |
+| Backend framework | FastAPI | Async-capable, auto-generates API docs, native Pydantic integration, WebSocket support |
 | Data validation | Pydantic v2 | Schema enforcement with custom validators, clean error messages |
 | PDF generation | ReportLab | Full programmatic control over layout, tables, and colours |
-| Frontend framework | React | Component model suits the grid component library concept |
+| SCADA persistence | SQLite | Zero-configuration, file-based, sufficient for 7-day time-series at 5-second intervals |
+| Frontend framework | React | Component model suits both the grid component library and SCADA panel concepts |
 | Canvas library | React Flow | Purpose-built for node/edge diagrams, handles drag, drop, and connections |
+| SCADA diagram | SVG + React state | Fixed-topology diagrams suit SVG better than React Flow; full control over IEC 60617 symbols |
+| SCADA charts | Recharts | Composable, handles time-series line charts with reference lines well |
 | State management | Zustand | Minimal boilerplate, no Provider wrapper, component access in one line |
 | Styling | Tailwind CSS | Utility-first, no fighting a UI framework |
 | Build tool | Vite | Fast HMR during development, optimised production builds |
@@ -172,7 +216,7 @@ New LineCode.XLPE150CU nphases=3 R1=0.124 X1=0.113 R0=0.372 X0=0.113 C1=0.28 uni
 ! Buses (comment only — buses are created implicitly by component references)
 
 ! Transformers
-New Transformer.[id] phases=3 windings=2 buses=[mv_bus,lv_bus] 
+New Transformer.[id] phases=3 windings=2 buses=[mv_bus,lv_bus]
     conns=[delta,wye] kVs=[11,0.4] kVAs=[500,500] %R=1.1 XHL=4.0
 
 ! Lines
@@ -285,14 +329,14 @@ for step in range(48):
     # Update each load directly
     dss.Text.Command(f"Load.{name}.kW={peak_kw * profile[step]}")
     dss.Text.Command(f"Load.{name}.kVAR={peak_kvar * profile[step]}")
-    
+
     # Update PV irradiance
     dss.Text.Command(f"PVSystem.{name}.irradiance={irr_profile[step]}")
-    
+
     # Solve snapshot
     dss.Text.Command("Set Mode=0")
     dss.Text.Command("Solve")
-    
+
     # Read results for this step
 ```
 
@@ -451,7 +495,7 @@ def _color_status_row(table, row_idx, ok):
 
 ---
 
-## 10. Frontend Architecture
+## 10. Frontend Architecture — Grid Simulator
 
 ### State management
 
@@ -526,7 +570,7 @@ Bus-to-load and bus-to-generator connections are filtered out — they exist onl
 
 ---
 
-## 11. Key Engineering Decisions
+## 11. Key Engineering Decisions — Grid Simulator
 
 ### Why not build a power flow solver from scratch?
 
@@ -599,3 +643,244 @@ Summer simulation energy totals for 100 kW PV panel:
 - This implies an average output of ~27.7 kW over 24 hours, or ~66.5% of peak rating
 - Capacity factor of 66.5% over the daylight-only hours (~13.5 hours) = 665 / (100 × 13.5) = 49% of peak during daylight
 - This is consistent with published clear-sky day capacity factors for Romania in summer
+
+---
+
+## 13. SCADA/HMI Module Architecture
+
+The SCADA module (`backend/scada/`) is a self-contained package added alongside the existing backend code. It is registered in `main.py` via:
+
+```python
+app.include_router(scada_router)
+```
+
+and started/stopped via the FastAPI lifespan context manager:
+
+```python
+@asynccontextmanager
+async def lifespan(app):
+    use_opendss = os.environ.get("USE_OPENDSS", "false").lower() == "true"
+    _manager, _state, _loop = init_scada(use_opendss=use_opendss)
+    _state.history_store.open()
+    _loop.start()
+    yield
+    _loop.stop()
+    _state.history_store.close()
+```
+
+### Module components
+
+| Class | File | Responsibility |
+|-------|------|----------------|
+| `DataSource` | `data_source.py` | Abstract interface — one method: `get_measurements()` |
+| `SyntheticDataSource` | `data_source.py` | Generates measurements mathematically from time-of-day profiles |
+| `OpenDSSDataSource` | `data_source.py` | Runs real power flow; builds DSS script from breaker states |
+| `ScadaState` | `simulation_loop.py` | Mutable session state: breaker positions, last measurements, alarm engine, event log, history store |
+| `ConnectionManager` | `simulation_loop.py` | Tracks WebSocket connections, broadcasts packets |
+| `SimulationLoop` | `simulation_loop.py` | asyncio background task, runs every 5 seconds |
+| `AlarmEngine` | `alarm_engine.py` | Threshold evaluation, alarm lifecycle management |
+| `EventLog` | `event_log.py` | Ring buffer of timestamped events (500 entries) |
+| `HistoryStore` | `history_store.py` | SQLite persistence for trend data |
+
+### Why asyncio instead of a thread?
+
+The simulation loop runs as an `asyncio.Task` (not a thread) because FastAPI/uvicorn is built on asyncio. Running the loop in the same event loop as the WebSocket handlers means broadcasts are non-blocking and there is no need for thread-safe locks around the shared `ScadaState`. The loop calls `await asyncio.sleep(interval)` between ticks, yielding control to the event loop so WebSocket messages and REST requests are handled normally between ticks.
+
+---
+
+## 14. SCADA Data Sources
+
+### DataSource abstraction
+
+```python
+class DataSource(ABC):
+    @abstractmethod
+    def get_measurements(self, breaker_states: Dict[str, str]) -> ScadaMeasurements:
+        ...
+```
+
+All SCADA backend code interacts only with this interface. The concrete implementation is chosen at startup via `USE_OPENDSS` and injected into `SimulationLoop`.
+
+### SyntheticDataSource
+
+Generates physically plausible measurements without OpenDSS:
+
+- **Voltage profile:** composite sinusoidal function of time-of-day, modelling morning load dip (~08:00), solar support midday (~14:00), and evening peak (~19:00), plus ±0.003 pu random noise per tick
+- **Load factor:** sinusoidal daily curve (peak at ~09:00 and ~19:00, minimum at ~03:00)
+- **Energisation logic:** mirrors the backend interlock rules — open breakers cause downstream buses to read 0.0 pu, which triggers DE_ENERGISED alarms
+
+### OpenDSSDataSource
+
+Builds a complete DSS script for the fixed substation topology on every call to `get_measurements()`. Breaker states are modelled as OpenDSS Line switch elements — closed breakers use near-zero impedance, open breakers are disabled (`enabled=n`). Commands are issued one line at a time via `dss.Text.Command()`. If the power flow fails to converge, `OpenDSSDataSource` returns zero measurements rather than crashing the simulation loop.
+
+---
+
+## 15. SCADA Alarm Engine
+
+### Alarm lifecycle
+
+```
+Condition detected on tick N
+        │
+        ▼
+ACTIVE alarm created (raised_at = now)
+Logged to EventLog
+        │
+        ▼ (operator clicks ACK)
+ACKNOWLEDGED (acked_at = now)
+Logged to EventLog
+        │
+        ▼ (condition clears on tick M)
+CLEARED (cleared_at = now)
+Logged to EventLog
+Removed from active alarm dict
+```
+
+Acknowledging an alarm does not clear it. Clearing happens automatically when the measurement returns to within limits.
+
+### Alarm IDs
+
+Alarm IDs are deterministic: `ALM-{element_id}-{condition_id}` (e.g. `ALM-BUS_A-VOLT_HIGH`). This means the frontend can always correlate the same alarm across multiple WebSocket packets without a UUID lookup table.
+
+### Threshold evaluation
+
+Every tick, the engine evaluates all thresholds against all elements. If a condition is newly active and no alarm exists for that ID, a new alarm is created. If a condition is no longer active and an alarm exists, it is cleared. The engine never duplicates alarms — re-evaluation of an already-active alarm only updates the message.
+
+---
+
+## 16. SCADA WebSocket Protocol
+
+### Connection lifecycle
+
+1. Client connects to `ws://localhost:8000/scada/ws`
+2. Backend registers client with `ConnectionManager`
+3. Backend immediately sends the latest measurement snapshot so the UI is not blank
+4. Backend broadcasts a new packet on every simulation tick (every 5 seconds)
+5. Client may send control messages at any time between ticks
+6. On disconnect, backend removes client from `ConnectionManager`
+
+### Packet format (backend → client)
+
+```json
+{
+  "type": "state_update",
+  "timestamp": "2026-07-27T18:23:01.234567+00:00",
+  "breaker_states": { "CB1": "CLOSED", "CB3": "OPEN" },
+  "buses": {
+    "BUS_A": { "voltage_kv": 11.023, "voltage_pu": 1.0021, "voltage_nom": 11.0 }
+  },
+  "branches": {
+    "FEEDER1": { "current_a": 45.2, "ampacity_a": 200.0, "loading_pct": 22.6, "power_kw": 380.1, "power_kvar": 120.3 }
+  },
+  "transformers": {
+    "TX1": { "primary_kv": 11.0, "secondary_kv": 0.4, "current_a": 18.1, "rated_kva": 630.0, "loading_pct": 34.2, "power_kw": 212.0, "power_kvar": 65.0 }
+  },
+  "alarms": [
+    {
+      "id": "ALM-BUS_A-VOLT_HIGH",
+      "priority": "MEDIUM",
+      "state": "ACTIVE",
+      "element": "BUS_A",
+      "condition": "VOLT_HIGH",
+      "message": "BUS_A voltage 1.0723 pu exceeds warning high limit (1.06 pu / EN 50160)",
+      "raised_at": "2026-07-27T18:21:03.000000+00:00",
+      "acked_at": null,
+      "cleared_at": null
+    }
+  ]
+}
+```
+
+### Control messages (client → backend)
+
+```json
+{ "type": "breaker_command", "breaker_id": "CB3", "command": "OPEN" }
+{ "type": "alarm_ack",       "alarm_id":   "ALM-BUS_A-VOLT_HIGH" }
+```
+
+On receiving a `breaker_command`, the backend applies the state change, logs the operation, re-runs measurements immediately, re-evaluates alarms, and broadcasts the updated packet to all connected clients.
+
+---
+
+## 17. SCADA History Store
+
+### Database location
+
+`backend/scada/scada_history.db` — created automatically on first startup.
+
+### Write rate and storage estimate
+
+At 5-second intervals with 4 buses, 2 transformers, and 3 branches: approximately 9 rows per tick × 12 ticks per minute × 60 minutes × 24 hours × 7 days = ~1.09 million rows per week. At roughly 100 bytes per row this is approximately 109 MB for a full 7-day retention window.
+
+### Downsampling
+
+Query responses are downsampled before being sent to the frontend:
+
+| Window | Minimum interval between points | Max points per series |
+|--------|--------------------------------|----------------------|
+| 1h | 10 seconds | ~360 |
+| 6h | 30 seconds | ~720 |
+| 24h | 2 minutes | ~720 |
+| 7d | 10 minutes | ~1008 |
+
+### WAL mode
+
+The database is opened with `PRAGMA journal_mode=WAL` (Write-Ahead Logging). WAL allows concurrent readers during writes, which matters because the simulation loop writes every 5 seconds while the REST endpoints may be reading simultaneously.
+
+---
+
+## 18. SCADA Frontend Architecture
+
+### Component tree
+
+```
+ScadaApp.jsx (route: /scada)
+├── SingleLineDiagram.jsx     — SVG, reads from scadaStore
+│   ├── SldElements.jsx       — reusable SVG primitives
+│   └── (onClick → dialog)
+├── BreakerControlDialog.jsx  — modal, evaluates interlocks
+│   └── interlock_engine.js   — pure functions, no React state
+├── AlarmPanel.jsx            — active + acknowledged alarms
+├── Section (collapsible)
+│   ├── BusesTable
+│   └── TransformersTable
+├── HistoricalTrends.jsx      — tabbed chart panel
+│   └── TrendChart.jsx        — Recharts wrapper
+└── EventLog.jsx              — REST-polled event table
+```
+
+### Two Zustand stores
+
+`gridStore.js` — Grid Simulator state (nodes, edges, simulation results). Completely independent of SCADA.
+
+`scadaStore.js` — SCADA state: WebSocket status, live measurements, breaker states, alarms. The WebSocket hook (`useWebSocket.js`) writes into this store on every incoming packet; all components read from it.
+
+### Interlock engine design
+
+`interlock_engine.js` is a pure JavaScript module with no React dependencies. It exports `evaluateOperation(breakerId, command, breakerStates)` which returns `{ outcome, findings }`. The module mirrors the backend energisation logic exactly — both use the same topology rules.
+
+Running interlock evaluation on the frontend means operators see the interlock result immediately on hover, without a round trip. The backend still enforces correctness — the frontend prevents the command from being sent in the first place.
+
+---
+
+## 19. Key Engineering Decisions — SCADA
+
+### Why not proxy the SCADA WebSocket through Vite?
+
+Vite's proxy does support WebSocket (`ws: true`). However, during development the WebSocket connection is more reliable when pointed directly at `ws://localhost:8000/scada/ws` rather than routing through the proxy. The proxy was retained in `vite.config.js` for completeness but the hook uses the direct URL.
+
+### Why SQLite for history instead of a time-series database?
+
+InfluxDB and TimescaleDB are excellent but require separate installation and configuration. SQLite is a single file, requires no server, and is bundled with Python. For a 7-day retention window at 5-second intervals, SQLite with WAL mode and appropriate indexes handles the write rate comfortably. The `HistoryStore` class abstracts the storage layer, so replacing SQLite with a proper TSDB in a production deployment would only require implementing a new class behind the same interface.
+
+### Why SVG instead of React Flow for the SCADA diagram?
+
+SCADA single-line diagrams have fixed layouts that operators memorise. The diagram is not user-editable. React Flow is designed for interactive node editors where the user controls layout — it would add unnecessary complexity and fight against the fixed-layout requirement. Raw SVG with React state overlaid gives complete control over symbol placement, line routing, and IEC 60617 symbol shapes.
+
+### Why synthetic data by default?
+
+The synthetic data source allows the entire SCADA stack — WebSocket, alarm engine, event log, history store, trend charts — to be developed and tested independently of OpenDSS. This means a developer without opendssdirect installed can still run and understand the SCADA module. OpenDSS mode is opt-in via environment variable.
+
+### Why is the SCADA topology fixed?
+
+Real SCADA systems are always configured for a specific fixed substation — operators need to memorise the layout. Making the topology dynamic (user-editable like Grid Simulator) would require auto-layout of SVG diagrams, dynamic interlock rule generation, and a topology editor that duplicates Grid Simulator's functionality. The fixed topology approach correctly represents how production SCADA systems work and keeps the complexity in the right places: data flow, alarm management, and interlock logic.

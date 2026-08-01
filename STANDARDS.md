@@ -1,6 +1,6 @@
-# Standards Reference — Grid Simulator
+# Standards Reference — Grid Simulator & SCADA/HMI
 
-This document lists every IEC and EN standard used in Grid Simulator, explaining what each one governs and how it is applied in the simulation. All component parameters and result limits are sourced from these standards rather than assumed or approximated.
+This document lists every IEC and EN standard used in Grid Simulator and the SCADA/HMI module, explaining what each one governs and how it is applied. All component parameters, result limits, alarm thresholds, and diagram symbols are sourced from these standards rather than assumed or approximated.
 
 ---
 
@@ -24,6 +24,17 @@ This document lists every IEC and EN standard used in Grid Simulator, explaining
 **Nominal voltages used:**
 - MV network: 11 kV line-to-line / 6.35 kV line-to-neutral
 - LV network: 0.4 kV line-to-line / 0.231 kV line-to-neutral
+
+**Applied in SCADA/HMI:**
+
+| Threshold | Limit | Alarm Priority |
+|-----------|-------|---------------|
+| Voltage high warning | > 1.06 pu (+6%) | MEDIUM |
+| Voltage high critical | > 1.10 pu (+10%) | HIGH |
+| Voltage low warning | < 0.94 pu (−6%) | MEDIUM |
+| Voltage low critical | < 0.90 pu (−10%) | HIGH |
+
+The SCADA alarm engine evaluates these thresholds on every simulation tick (every 5 seconds). Warning thresholds are set at ±6% to give operators advance warning before the statutory ±10% limit is reached. Reference lines at ±6% (amber) and ±10% (red) are drawn on the historical voltage trend charts.
 
 ---
 
@@ -111,7 +122,7 @@ The transformer component uses Dyn11 as its vector group:
 
 **OpenDSS implementation:** The vector group is translated to the `conns=[delta, wye]` parameter in OpenDSS transformer objects.
 
-**Transformer parameters used:**
+**Transformer parameters used (Grid Simulator):**
 
 | Parameter | Value | Basis |
 |-----------|-------|-------|
@@ -120,6 +131,17 @@ The transformer component uses Dyn11 as its vector group:
 | Secondary voltage | 0.4 kV | EU standard LV distribution voltage |
 | Winding resistance (%R) | 1.1% | Typical value for 500 kVA distribution transformer |
 | Leakage reactance (%X) | 4.0% | Typical value for 500 kVA distribution transformer |
+
+**Applied in SCADA/HMI:**
+
+The SCADA substation includes TX1 and TX2, each 630 kVA, modelled with %Z = 4% (%X = 4%, %R = 0.5%) in the OpenDSS data source. IEC 60076-1 loading limits are applied as SCADA alarm thresholds:
+
+| Threshold | Limit | Alarm Priority |
+|-----------|-------|---------------|
+| Transformer loading warning | > 70% rated kVA | MEDIUM |
+| Transformer loading critical | > 90% rated kVA | HIGH |
+
+Reference lines at 70% (amber) and 90% (red) are drawn on the TX Loading historical trend chart.
 
 ---
 
@@ -144,6 +166,8 @@ In Grid Simulator, the `kw_peak` parameter of the Solar PV component represents 
 **Temperature coefficient:** The `temp_coefficient_pct` parameter (default -0.35%/°C) captures the reduction in PV output as cell temperature rises above 25°C. This parameter is used in time-series simulations where temperature derating is relevant.
 
 **OpenDSS PVSystem object:** Solar PV uses the dedicated `PVSystem` object rather than a `Generator` object. The PVSystem object correctly implements irradiance-dependent output scaling, inverter current limiting, and volt-VAR response.
+
+**Applied in SCADA/HMI:** The SCADA substation includes PV1 (50 kW peak) connected to Bus C via CB7. In synthetic mode, PV output follows the same irradiance profile as Grid Simulator (zero between 20:00 and 06:00). In OpenDSS mode, PV1 is modelled as a generator with output scaled by the time-of-day irradiance factor.
 
 ---
 
@@ -185,15 +209,39 @@ The assumption Z1 = Z2 (positive and negative sequence impedances are equal) is 
 
 ---
 
+## Graphical Symbols
+
+### IEC 60617 — Graphical Symbols for Diagrams
+
+**Scope:** Provides graphical symbols for use in electrotechnical diagrams, including symbols for switching devices, transformers, measuring instruments, busbars, and connection points.
+
+**Applied in SCADA/HMI:**
+
+The SCADA single-line diagram SVG follows IEC 60617 symbol conventions:
+
+| Symbol | IEC 60617 Basis | Implementation |
+|--------|----------------|----------------|
+| Circuit breaker | Square on conductor line (IEC 60617-7) | Filled square (closed), hollow square (open) |
+| Busbar | Thick horizontal line | 6px stroke, coloured by voltage state |
+| Two-winding transformer | Two interlocking circles | Upper circle (primary), lower circle (secondary) |
+| Load | Rectangle with internal lines | Resistor symbol inside rectangle |
+| PV source | Circle with rays | Sun symbol with filled core |
+| Power flow direction | Arrow on conductor | Downward arrow at feeder entry points |
+
+Colour coding is not specified by IEC 60617 but follows common industrial practice: green for energised/healthy, amber for warning, red for alarm/fault, grey for de-energised.
+
+---
+
 ## Summary Table
 
-| Standard | Full title | Governs in Grid Simulator |
-|----------|-----------|--------------------------|
-| **EN 50160** | Voltage Characteristics of Electricity Supplied by Public Distribution Networks | Voltage quality limits (±10% nominal), applied to all bus voltage results |
+| Standard | Full title | Governs |
+|----------|-----------|---------|
+| **EN 50160** | Voltage Characteristics of Electricity Supplied by Public Distribution Networks | Voltage quality limits (±10% nominal). Applied to all bus voltage results in Grid Simulator and to SCADA alarm thresholds (±6% warning, ±10% critical). |
 | **IEC 61089** | Round Wire Concentric Lay Overhead Electrical Stranded Conductors | ACSR 150mm² resistance and ampacity values |
 | **EN 50182** | Conductors for Overhead Lines — Round Wire Concentric Lay Stranded Conductors | ACSR 150mm² European naming and construction |
 | **IEC 60502-2** | Power Cables with Extruded Insulation for 6 kV to 30 kV | 12/20kV XLPE cable ratings and construction |
 | **IEC 60228** | Conductors of Insulated Cables | 150mm² Cu conductor resistance at rated temperature |
-| **IEC 60076-1** | Power Transformers — General | Dyn11 vector group definition and transformer parameters |
+| **IEC 60076-1** | Power Transformers — General | Dyn11 vector group definition, transformer parameters, and SCADA loading alarm thresholds (70%/90%) |
 | **IEC 61215** | Terrestrial PV Modules — Design Qualification and Type Approval | Standard Test Conditions (1.0 kW/m², 25°C) for PV rating |
 | **EN 60909** | Short-Circuit Currents in Three-Phase AC Systems | Fault current calculation methodology (Thevenin method) |
+| **IEC 60617** | Graphical Symbols for Diagrams | SCADA single-line diagram symbol conventions |

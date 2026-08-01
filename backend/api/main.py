@@ -15,6 +15,8 @@ Then open:
   http://localhost:8000/redoc  ← alternative docs view
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
@@ -33,6 +35,31 @@ from backend.api.report_generator import generate_report
 
 from backend.solver.solver_fault import run_fault_study
 
+# ── SCADA module ──────────────────────────────────────────────────────────────
+from backend.api.scada_router import router as scada_router, init_scada
+import os
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIFESPAN — start/stop the SCADA simulation loop with the app
+# ─────────────────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Read config from environment variable
+    # Set USE_OPENDSS=true before starting uvicorn to enable real power flow
+    use_opendss = os.environ.get("USE_OPENDSS", "false").lower() == "true"
+
+    # Start SCADA background loop on startup
+    _manager, _state, _loop = init_scada(use_opendss=use_opendss)
+    _state.history_store.open()
+    _loop.start()
+    yield
+    # Stop cleanly on shutdown
+    _loop.stop()
+    _state.history_store.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # APP INITIALISATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,21 +72,18 @@ app = FastAPI(
         "and returns bus voltages, line currents, power losses, and generator outputs. "
         "All components and results follow EU/IEC standards."
     ),
-    version = "0.1.0",
+    version  = "0.2.0",
+    lifespan = lifespan,
 )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORS MIDDLEWARE
-# CORS (Cross-Origin Resource Sharing) allows your React frontend running on
-# localhost:3000 to make requests to this API running on localhost:8000.
-# Without this, the browser blocks the requests for security reasons.
-# In production this would be locked down to your actual domain.
 # ─────────────────────────────────────────────────────────────────────────────
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["http://localhost:3000"],  # React dev server
+    allow_origins     = ["http://localhost:5173", "http://localhost:3000"],
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
@@ -67,9 +91,15 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SCADA ROUTER
+# All SCADA endpoints are mounted under /scada
+# ─────────────────────────────────────────────────────────────────────────────
+
+app.include_router(scada_router)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HEALTH CHECK
-# A simple endpoint to verify the server is running.
-# Hit http://localhost:8000/health in your browser to confirm.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -96,9 +126,6 @@ def simulate(grid: Grid):
     """
 
     # ── Step 1: Translate Grid → DSS script ───────────────────────────────────
-    # If the translator raises an exception it means the grid is valid per
-    # Pydantic but has a logical issue the translator caught (e.g. a bus
-    # referenced by a load doesn't exist in the bus list).
     try:
         dss_script = translate_grid(grid)
     except Exception as e:
@@ -116,18 +143,11 @@ def simulate(grid: Grid):
             detail      = f"Solver error: {str(e)}"
         )
 
-    # ── Step 3: Return results ────────────────────────────────────────────────
-    # to_dict() converts the SimulationResult dataclass into a plain dictionary
-    # which FastAPI automatically serialises to JSON.
     return result.to_dict()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEBUG ENDPOINT — DSS Script Preview
-# This is a development tool. It returns the raw DSS script that would be
-# sent to OpenDSS for a given grid, without actually running the simulation.
-# Very useful for debugging translator output during development.
-# Remove or protect this endpoint before any public deployment.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/preview-dss")
@@ -154,18 +174,8 @@ def preview_dss(grid: Grid):
 def simulate_timeseries(request: TimeSeriesRequest):
     """
     Run a 48-step daily time-series simulation on the submitted grid.
-
-    Request body: TimeSeriesRequest containing:
-      - grid: complete Grid JSON object
-      - season: 'summer' or 'winter'
-      - peak_load_multiplier: 0.1 to 2.0 (default 1.0)
-
-    Response: 48-step results with voltage profiles, energy totals,
-              and EN 50160 violation counts.
     """
 
-    # ── Step 1: Build scaled profiles ─────────────────────────────────────────
-    # Find peak load values from the grid components
     peak_residential = max(
         (l.kw for l in request.grid.residential_loads), default=5.0
     )
@@ -186,7 +196,6 @@ def simulate_timeseries(request: TimeSeriesRequest):
             detail=f"Profile generation failed: {str(e)}"
         )
 
-    # ── Step 2: Translate grid to time-series DSS script ──────────────────────
     try:
         dss_script = translate_grid_timeseries(request.grid, profiles)
     except Exception as e:
@@ -195,7 +204,6 @@ def simulate_timeseries(request: TimeSeriesRequest):
             detail=f"Grid translation failed: {str(e)}"
         )
 
-    # ── Step 3: Run time-series simulation ────────────────────────────────────
     try:
         result = run_timeseries(
             dss_script           = dss_script,
